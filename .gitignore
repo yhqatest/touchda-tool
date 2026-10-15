@@ -1,0 +1,10 @@
+# 个人配置 / 名单 / 运行产物——不进仓库
+config.json
+data/
+.snapshots/
+*.xlsx
+*.png
+*.log
+__pycache__/
+.pytest_cache/
+.DS_Store
