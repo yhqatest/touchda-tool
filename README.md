@@ -15,8 +15,10 @@
 
 ## 安装（只要做一次）
 
+仓库是私有的：先把你的 GitHub 账号发给维护人，被加为 Collaborator 并接受邀请后才能 clone。
+
 ```bash
-git clone <仓库地址> ~/touchda-tool
+git clone https://github.com/yhqatest/touchda-tool.git ~/touchda-tool
 cd ~/touchda-tool
 ./install.sh
 ```
