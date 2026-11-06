@@ -968,7 +968,7 @@ def ensure_hit_user_count(page) -> None:
         log("    WARN: 命中用户数仍为 0，发布可能被拦住")
 
 
-def step_9_verify_status(page) -> None:
+def step_9_verify_status(page) -> dict | None:
     """发布后回列表核对刚建的任务，输出一行 STATUS:<json> 给 bot / GUI 用。
 
     2026-08 改版后 vm.campaignList 这条路走不通了（scope 锚点和字段都变了），
@@ -986,7 +986,7 @@ def step_9_verify_status(page) -> None:
             )
         except Exception:
             pass
-        page.wait_for_selector('input[ng-model="vm.campaignsQuery.name"]', timeout=20000)
+        page.wait_for_selector('input[ng-model="vm.campaignsQuery.name"]', timeout=60000)   # 后台慢时 20s 不够
 
         # 按任务名称过滤 → 查询。每轮都重新填+点：发布后页面会 reload，第一下「查询」
         # 常落在 reload 途中被吞掉，只查一次的话后面怎么读表格都是空的（2026-11-06 8 次漏 6 次）。
@@ -1022,7 +1022,7 @@ def step_9_verify_status(page) -> None:
                         taskId: pick('任务ID'), name: pick('任务名称'),
                         type: pick('任务类型'), anti: pick('防干扰'),
                         status: pick('任务状态'), executed: pick('已执行次数'),
-                        remark: pick('备注'), publishedAt: pick('发布时间'),
+                        remark: pick('备注'), createdAt: pick('任务创建时间'),
                         publisher: pick('发布人'), _heads: heads,
                     };
                 }"""
@@ -1044,17 +1044,17 @@ def step_9_verify_status(page) -> None:
 
         if not row:
             log(f"  (查了 {tries} 次列表里都没找到刚发布的任务 — 可能还在异步落库)")
-            return
-        heads = row.pop("_heads", None)
-        if not row.get("publishedAt"):
-            log(f"  (发布时间列为空；表头 = {heads})")
+            return None
+        row.pop("_heads", None)
         log("  任务状态: " + json.dumps(row, ensure_ascii=False))
         print("STATUS:" + json.dumps(row, ensure_ascii=False), flush=True)
+        return row
     except Exception as e:
         log(f"  (verify status failed: {e})")
+        return None
 
 
-def step_8_publish(page) -> None:
+def step_8_publish(page) -> bool:
     # The upload (step 3) already populates vm.newCampaign.hitUserCount with the
     # imported list size. Calling getHitUserCount() here would *replace* that
     # with the global ALL-strategy count, sending the campaign to every user
@@ -1102,15 +1102,22 @@ def step_8_publish(page) -> None:
     # The success handler calls window.location.reload() — the load event is
     # our reliable success signal. The post-reload list view is filtered &
     # empty by default, so don't try to verify the task name there.
-    with page.expect_event("load", timeout=30000):
-        page.evaluate(
-            "() => { const b = document.querySelector('button[type=submit]')"
-            " || Array.from(document.querySelectorAll('button'))"
-            ".find(x => x.textContent.trim() === '发布任务');"
-            " if (!b) throw new Error('发布任务 按钮找不到');"
-            " if (b.disabled) throw new Error('发布任务 按钮是禁用的（多半是没点获取拿用户数）');"
-            " b.click(); }"
-        )
+    # 后台慢的时候发布成功后的 reload 30s 内等不到 load（白屏），以前直接判失败，
+    # 其实任务已经发出去了（2026-11-06 Freeplay T004495）。超时就返回 False，交给调用方回列表核实。
+    try:
+        with page.expect_event("load", timeout=30000):
+            page.evaluate(
+                "() => { const b = document.querySelector('button[type=submit]')"
+                " || Array.from(document.querySelectorAll('button'))"
+                ".find(x => x.textContent.trim() === '发布任务');"
+                " if (!b) throw new Error('发布任务 按钮找不到');"
+                " if (b.disabled) throw new Error('发布任务 按钮是禁用的（多半是没点获取拿用户数）');"
+                " b.click(); }"
+                )
+    except PWTimeout:
+        log("    发布后 30s 没等到页面 reload — 回列表核实是否已发布")
+        return False
+    return True
 
 
 def run() -> None:
@@ -1175,7 +1182,17 @@ def run() -> None:
                     # 验证用：无头填完 1-7 步 + 截图，就是不点发布
                     print(f"OK:DRY_RUN:{TASK_NAME}", flush=True)
                     return
-                step_8_publish(page)
+                if not step_8_publish(page):
+                    try:
+                        page.goto(CAMPAIGN_URL, wait_until="domcontentloaded", timeout=60000)
+                    except Exception as e:
+                        log(f"    重新打开列表也超时了：{e}")
+                    if not step_9_verify_status(page):
+                        raise RuntimeError("点了发布但页面没刷新，列表里也查不到任务 — 去后台确认是否已发布，别直接重派")
+                    if shot:
+                        lark_say_image(shot)
+                    print(f"OK:{TASK_NAME}", flush=True)
+                    return
                 if shot:
                     lark_say_image(shot)
                 print(f"OK:{TASK_NAME}", flush=True)
