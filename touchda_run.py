@@ -10,7 +10,7 @@ when the task appears in the list.
 默认在专用 Chrome 的可见标签页里跑（2026-10-06 起；无头太慢，还会出现 /campaign 白屏、
 找不到「创建触达任务」）。TOUCHDA_HEADLESS=1 才借登录态（cookie + localStorage，见
 chrome_cdp.headless_context）在无头 Chrome 里跑。发布前截一张表单图存
-.snapshots/touchda_prepublish.png，bot 触发时一并发回群里留底。手动发布（AUTO_PUBLISH=0）必须有人点，
+.snapshots/touchda_prepublish_<类型>_<时间>.png，bot 触发时一并发回群里留底。手动发布（AUTO_PUBLISH=0）必须有人点，
 所以永远走可见标签页，无视 TOUCHDA_HEADLESS。
 """
 import os
@@ -790,6 +790,21 @@ def step_7_popup(page) -> None:
     )
     # Brief settle for any async popup list/config fetch.
     page.wait_for_timeout(1500)
+    # 通用弹窗的配置是异步拉的（_popupFetchInFlight）。没拉完就点「确定」，
+    # getGeneralPopupConfigForGroup 会抛错、弹窗关不掉（2026-11-06 Freeplay 首跑踩到）。
+    try:
+        page.wait_for_function(
+            """() => {
+                const r = document.querySelector('input[ng-model="vm.popupConfigType"]');
+                const vm = r && angular.element(r).scope() && angular.element(r).scope().vm;
+                if (!vm) return true;
+                if (vm._popupFetchInFlight) return false;
+                return vm.popupConfigType !== 'general' || !!vm.popupGeneralConfig;
+            }""",
+            timeout=15000,
+        )
+    except PWTimeout:
+        log("    弹窗配置 15s 还没拉完，照样点确定试试")
     log("Step 7c: confirm")
     # 泥码这类要异步拉 popupConfigList，列表没就绪就点「确定」会被校验拦住而弹窗不关。
     # 单跑时通常赶得上，连着批量跑就会翻车 —— 所以点完检查弹窗有没有真的关，没关就重点。
@@ -815,7 +830,16 @@ def step_7_popup(page) -> None:
             closed = True
             break
         except PWTimeout:
-            log(f"    确定 未生效（第 {attempt + 1} 次），等 3s 重试")
+            log(f"    确定 未生效（第 {attempt + 1} 次），重选弹窗形态后等 3s 重试")
+            # 重点一次 radio 会重新触发 onPopupConfigTypeChange → 重新拉配置
+            page.evaluate(
+                """(want) => {
+                    const r = Array.from(document.querySelectorAll('input[ng-model="vm.popupConfigType"]'))
+                        .find(x => x.value === want && x.offsetParent !== null);
+                    if (r) r.click();
+                }""",
+                POPUP_TYPE,
+            )
             page.wait_for_timeout(3000)
     if not closed:
         raise RuntimeError("弹窗配置没有关闭 — 「确定」连点 3 次都被校验拦住")
@@ -964,10 +988,11 @@ def step_9_verify_status(page) -> None:
             pass
         page.wait_for_selector('input[ng-model="vm.campaignsQuery.name"]', timeout=20000)
 
-        # 按任务名称过滤，否则列表默认是空的（发布后视图带筛选）
-        page.evaluate(
-            """(name) => {
+        # 按任务名称过滤 → 查询。每轮都重新填+点：发布后页面会 reload，第一下「查询」
+        # 常落在 reload 途中被吞掉，只查一次的话后面怎么读表格都是空的（2026-11-06 8 次漏 6 次）。
+        requery = """(name) => {
                 const el = document.querySelector('input[ng-model="vm.campaignsQuery.name"]');
+                if (!el) return false;
                 el.value = name;
                 el.dispatchEvent(new Event('input', {bubbles: true}));
                 el.dispatchEvent(new Event('change', {bubbles: true}));
@@ -975,15 +1000,9 @@ def step_9_verify_status(page) -> None:
                 const q = Array.from(document.querySelectorAll('button'))
                     .find(b => b.textContent.trim() === '查询' && b.offsetParent !== null);
                 if (q) q.click();
-            }""",
-            TASK_NAME,
-        )
-
-        row = None
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
-            row = page.evaluate(
-                r"""(name) => {
+                return !!q;
+            }"""
+        read_row = r"""(name) => {
                     const tbl = Array.from(document.querySelectorAll('table'))
                         .filter(t => t.offsetParent !== null)
                         .find(t => /任务名称/.test(t.innerText));
@@ -1004,18 +1023,31 @@ def step_9_verify_status(page) -> None:
                         type: pick('任务类型'), anti: pick('防干扰'),
                         status: pick('任务状态'), executed: pick('已执行次数'),
                         remark: pick('备注'), publishedAt: pick('发布时间'),
-                        publisher: pick('发布人'),
+                        publisher: pick('发布人'), _heads: heads,
                     };
-                }""",
-                TASK_NAME,
-            )
+                }"""
+
+        row = None
+        tries = 0
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            try:
+                page.evaluate(requery, TASK_NAME)
+                tries += 1
+                page.wait_for_timeout(2500)
+                row = page.evaluate(read_row, TASK_NAME)
+            except Exception:
+                row = None     # reload 途中 evaluate 会抛（context destroyed），下一轮再来
+                page.wait_for_timeout(1500)
             if row and row.get("status"):
                 break
-            page.wait_for_timeout(2000)
 
         if not row:
-            log("  (列表里没找到刚发布的任务 — 可能还在异步落库)")
+            log(f"  (查了 {tries} 次列表里都没找到刚发布的任务 — 可能还在异步落库)")
             return
+        heads = row.pop("_heads", None)
+        if not row.get("publishedAt"):
+            log(f"  (发布时间列为空；表头 = {heads})")
         log("  任务状态: " + json.dumps(row, ensure_ascii=False))
         print("STATUS:" + json.dumps(row, ensure_ascii=False), flush=True)
     except Exception as e:
@@ -1127,9 +1159,13 @@ def run() -> None:
             step_7c_content(page)
             ensure_hit_user_count(page)
             if AUTO_PUBLISH:
-                shot = BOT_DIR / ".snapshots" / "touchda_prepublish.png"
+                # 带类型+时间：连派几种时以前同一个文件名互相覆盖，只剩最后一张
+                shot = BOT_DIR / ".snapshots" / f"touchda_prepublish_{REWARD_TYPE}{time.strftime('_%m%d-%H%M%S')}.png"
                 try:
                     shot.parent.mkdir(exist_ok=True)
+                    for old in sorted(shot.parent.glob("touchda_prepublish_*.png"),
+                                     key=lambda f: f.stat().st_mtime)[:-30]:
+                        old.unlink(missing_ok=True)     # 只留最近 30 张
                     page.screenshot(path=str(shot), full_page=True)
                     log(f"发布前表单截图：{shot}")
                 except Exception as e:

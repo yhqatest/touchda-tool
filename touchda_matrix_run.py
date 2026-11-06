@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -107,10 +108,23 @@ def main() -> int:
         )
         dur = time.time() - t0
         ok = proc.returncode == 0
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        note = tail[-1][:150] if tail else ""
+        if ok:
+            # PASS 时备注放任务名 + 回查到的任务号/状态，省得再去列表里翻
+            out_lines = (proc.stdout or "").splitlines()
+            name = next((l[3:] for l in out_lines if l.startswith("OK:")), "")
+            st = next((l[7:] for l in out_lines if l.startswith("STATUS:")), "")
+            try:
+                st = json.loads(st) if st else {}
+            except ValueError:
+                st = {}
+            note = name + (f"  {st.get('taskId')} {st.get('status')}" if st else "  (列表未回查到)")
+        else:
+            # 优先取 ERR: 行；以前取最后一行，常常只拿到一条 ==== 分隔线
+            tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip().splitlines()
+            errs = [l for l in tail if l.startswith("ERR:")]
+            note = (errs[-1] if errs else (tail[-1] if tail else ""))[:150]
         results.append((key, cn, "PASS" if ok else "FAIL", dur, note))
-        print(f"      {'PASS' if ok else 'FAIL'}  {dur:.0f}s  {note if not ok else ''}")
+        print(f"      {'PASS' if ok else 'FAIL'}  {dur:.0f}s  {note}")
         if not ok and args.stop_on_fail:
             print("\n--stop-on-fail：中断")
             break
@@ -119,7 +133,7 @@ def main() -> int:
     print(f"{'优惠类型':<20}{'结果':<8}{'耗时':>7}   备注")
     print("-" * 74)
     for _, cn, st, dur, note in results:
-        print(f"{cn:<20}{st:<8}{dur:>6.0f}s   {note[:36]}")
+        print(f"{cn:<20}{st:<8}{dur:>6.0f}s   {note[:60]}")
     n_pass = sum(1 for r in results if r[2] == "PASS")
     n_fail = sum(1 for r in results if r[2] == "FAIL")
     n_skip = sum(1 for r in results if r[2] == "SKIP")

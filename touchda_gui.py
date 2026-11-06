@@ -41,7 +41,7 @@ REWARD_OPTIONS = (
     ("coupon_pct",  "派优惠券 · 百分比（优惠代码）", "coupon_pct_template"),
     ("mud_deposit", "派泥码存送（泥码存送券）",     "mud_deposit_template"),
     ("fs",          "派 FS（FreeSpin）",          "fs_template"),
-    ("freeplay",    "派 Freeplay（正式站暂未上线）", "freeplay_template"),
+    ("freeplay",    "派 Freeplay", "freeplay_template"),
 )
 # (config 键, 标签, 宽度)
 TEMPLATE_FIELDS = (
@@ -171,6 +171,7 @@ class App:
         tools = tk.Frame(outer); tools.pack(fill="x", pady=(6, 0))
         tk.Button(tools, text="验证当前模版", command=self.on_verify).pack(side="left")
         tk.Button(tools, text="跑全部类型（只建不发）", command=self.on_matrix).pack(side="left", padx=6)
+        tk.Button(tools, text="全派（直接发布）", command=self.on_dispatch_all).pack(side="left", padx=(0, 6))
         tk.Button(tools, text="检查更新", command=self.on_update).pack(side="left")
         self.status = tk.StringVar(value="就绪")
         tk.Label(tools, textvariable=self.status, fg="#2e7d32").pack(side="left", padx=12)
@@ -337,7 +338,37 @@ class App:
                     "TOUCHDA_AUTO_PUBLISH": "1" if publish else "0"})
         threading.Thread(target=self._dispatch_bg, args=(ids, env, label), daemon=True).start()
 
-    def _dispatch_bg(self, ids: list[str], extra_env: dict, label: str) -> None:
+    # 「全派」覆盖的类型（Voucher / Credit Voucher / Reward Credit / Freespin / Freeplay）。
+    # 免费彩金、百分比优惠券不在里面；没填模版的由 touchda_matrix_run.py 跳过。
+    DISPATCH_ALL = ("coupon", "mud_deposit", "mud", "fs", "freeplay")
+
+    def on_dispatch_all(self) -> None:
+        if self.busy:
+            return
+        if not self.url():
+            messagebox.showerror("缺泳道名", "选了「泳道」就要填泳道名。")
+            return
+        ids = extract_player_ids(self.ids_text.get("1.0", "end"))
+        if not ids:
+            messagebox.showerror("没有 player id", "没识别出 player id（a 开头 + 数字，或纯数字）。")
+            return
+        names = dict((c, l) for c, l, _k in REWARD_OPTIONS)
+        kinds = " / ".join(names.get(c, c) for c in self.DISPATCH_ALL)
+        preview = "\n".join(ids[:15]) + (f"\n…（另 {len(ids) - 15} 个）" if len(ids) > 15 else "")
+        if not messagebox.askyesno("确认全派", f"环境：{self.url()}\n依次派：{kinds}\n{len(ids)} 个玩家：\n{preview}\n\n"
+                                              "⚠️ 每种都直接发布，奖励会真的发给这些玩家。确认？"):
+            return
+        self.busy = True
+        self.send_btn.configure(state="disabled")
+        self.status.set(f"全派中…（{len(ids)} 个）")
+        self.log("=" * 60)
+        self.log(f"全派：{kinds} · {len(ids)} 个 · {self.url()}")
+        args = [str(HERE / "touchda_matrix_run.py"), *self.DISPATCH_ALL, "--publish"]
+        threading.Thread(target=self._dispatch_bg, args=(ids, self.env_overrides(), "全派", args),
+                         daemon=True).start()
+
+    def _dispatch_bg(self, ids: list[str], extra_env: dict, label: str,
+                     args: list[str] | None = None) -> None:
         status = "派发线程异常退出"
         try:
             up = touchda_config.upload_dir()
@@ -358,7 +389,8 @@ class App:
 
             env = os.environ.copy()
             env.update(extra_env)
-            proc = subprocess.Popen([sys.executable, str(HERE / "touchda_run.py")], cwd=str(HERE), env=env,
+            proc = subprocess.Popen([sys.executable, *(args or [str(HERE / "touchda_run.py")])],
+                                    cwd=str(HERE), env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             ok, err, info, ready = False, "", None, False
             for line in proc.stdout:
@@ -379,7 +411,10 @@ class App:
                     except Exception:
                         pass
             proc.wait()
-            if ok and info:
+            if args:   # 全派走矩阵脚本，逐类结果已在日志汇总表里
+                status = ("🎉 全派完成" if proc.returncode == 0
+                          else f"全派有失败项（code={proc.returncode}），看日志汇总")
+            elif ok and info:
                 status = (f"🎉 已发布（{label}）· 上传 {info.get('hitCount', '?')} · "
                           f"验证 {info.get('actualHitCount', '?')} · 送达 {info.get('deliverySuccess', '?')}")
             elif ok:

@@ -66,6 +66,6 @@ cd ~/touchda-tool && git pull
 | `touchda_gui.py` | 小窗口 |
 | `touchda_run.py` | 真正填表的脚本，也能在命令行单独跑（参数都走环境变量，见文件头） |
 | `touchda_verify_template.py` | 只读检查某个模版在后台存不存在 |
-| `touchda_matrix_run.py` | 把每种优惠类型都跑一遍，默认只建不发 |
+| `touchda_matrix_run.py` | 把每种优惠类型都跑一遍，默认只建不发；GUI「全派」用它 `--publish` 给同一批玩家一次派完优惠代码 / 泥码存送 / 泥码 / FS / Freeplay |
 | `chrome_cdp.py` / `touchda_chrome.sh` | 启动和连接专用 Chrome |
 | `config.json` | 你个人的模版和设置（不会提交进仓库） |
