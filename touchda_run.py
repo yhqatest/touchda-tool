@@ -117,6 +117,7 @@ TASK_STAT_DAYS = 1
 # 旧值 "用户召回（遵循防干扰规则)" 这个合并选项已不存在。
 TASK_TYPE_LABEL = os.environ.get("TOUCHDA_TASK_TYPE", "流失召回")   # 流失召回/用户促活/新用户注册/营销补发
 FORCE_NOTIFY = os.environ.get("TOUCHDA_FORCE_NOTIFY", "0") == "1"  # 1=强制通知（无视防干扰规则）
+# TOUCHDA_REPEAT=N：同一批玩家连派 N 份（每份一个任务，第 2 份起自动强制通知），上限 20，见 run_repeat
 PUSH_STRATEGY_MODE = os.environ.get("TOUCHDA_PUSH_MODE", "ONE_TIME")  # ONE_TIME / RECURRING
 PUSH_TIME_LABEL = os.environ.get("TOUCHDA_PUSH_TIME", "创建任务后立即推送")
 # 兼容旧后台（若某些环境还没升级，下面两个 label 仍会被用到）
@@ -608,38 +609,44 @@ def _open_reward_modal(page, btn_labels) -> str:
     return label
 
 
-def _pick_reward_row(page, want: str, what: str) -> str:
-    """在已打开的选择弹窗里，按行文本选中包含 want 的那一行（点它的 radio）。
+_REWARD_ROWS_JS = r"""() => Array.from(document.querySelectorAll('tr'))
+    .filter(tr => tr.offsetParent !== null && tr.querySelector('input[type=radio]'))"""
+
+
+def _reward_rows(page, what: str) -> list:
+    """等选择弹窗里的模板行渲染出来，返回每行文字（空白压成一个空格）。
 
     2026-08 改版后弹窗是隔离作用域，拿不到 vm.currentSelectionList，
     所以改成纯 DOM：表格每行一个 radio，按行文字匹配。这样对 scope 变动免疫。
+    touchda_verify_template.py 也走这里，别再各写一份（它停在旧 vm 写法上误报过「列表是空的」）。
     """
     try:
-        page.wait_for_function(
-            "() => Array.from(document.querySelectorAll('tr'))"
-            ".some(tr => tr.offsetParent !== null && tr.querySelector('input[type=radio]'))",
-            timeout=20000,
-        )
+        page.wait_for_function(f"() => ({_REWARD_ROWS_JS})().length > 0", timeout=20000)
     except PWTimeout:
         raise RuntimeError(f"{what} 弹窗里没有可选行（后台可能没配这类模板）")
+    return page.evaluate(
+        f"() => ({_REWARD_ROWS_JS})().map(tr => (tr.innerText || '').replace(/\\s+/g, ' ').trim())"
+    )
 
+
+def _pick_reward_row(page, want: str, what: str) -> str:
+    """在已打开的选择弹窗里，按行文本选中包含 want 的那一行（点它的 radio）。"""
+    names = _reward_rows(page, what)
     res = page.evaluate(
-        r"""(want) => {
-            const rows = Array.from(document.querySelectorAll('tr'))
-                .filter(tr => tr.offsetParent !== null && tr.querySelector('input[type=radio]'));
-            const norm = t => (t || '').replace(/\s+/g, ' ').trim();
+        f"""(want) => {{
+            const rows = ({_REWARD_ROWS_JS})();
+            const norm = t => (t || '').replace(/\\s+/g, ' ').trim();
             const hit = rows.find(tr => norm(tr.innerText).includes(want));
-            if (!hit) return {ok: false, names: rows.slice(0, 25).map(tr => norm(tr.innerText).slice(0, 60))};
-            const r = hit.querySelector('input[type=radio]');
-            r.click();
-            return {ok: true, row: norm(hit.innerText).slice(0, 80), total: rows.length};
-        }""",
+            if (!hit) return {{ok: false}};
+            hit.querySelector('input[type=radio]').click();
+            return {{ok: true, row: norm(hit.innerText).slice(0, 80), total: rows.length}};
+        }}""",
         want,
     )
     if not res.get("ok"):
         raise RuntimeError(
             f"{what} 列表里没有匹配 {want!r} 的行。列表里实际有：\n    "
-            + "\n    ".join(res.get("names", []))
+            + "\n    ".join(n[:60] for n in names[:25])
         )
     log(f"    选中: {res['row']}  （共 {res['total']} 行）")
     return res["row"]
@@ -1311,5 +1318,28 @@ def run() -> None:
                     pass
 
 
+def run_repeat(n: int) -> None:
+    """同一批玩家连派 n 份（如「派 5 张券」）：每份一个触达任务，任务名带 i/n。
+
+    第 2 份起强制通知 —— 同一玩家短时间内连收，第 2 份起会被防干扰规则拦掉（2026-11-17 派 5 张时手动开的）。
+    哪一份失败 run() 就 sys.exit，后面的不再派，免得半截状态下继续加码。
+    """
+    global TASK_NAME, TASK_REMARK, FORCE_NOTIFY
+    base = _CFG["task_name"] + os.environ.get("TOUCHDA_TASK_SUFFIX", "")
+    for i in range(1, n + 1):
+        TASK_NAME = TASK_REMARK = f"{base} {i}of{n}" + time.strftime(" %m%d-%H%M%S")
+        FORCE_NOTIFY = FORCE_NOTIFY or i > 1
+        log(f"===== 第 {i}/{n} 份：{TASK_NAME}（{'强制通知' if FORCE_NOTIFY else '遵循防干扰'}） =====")
+        run()
+    print(f"OK:REPEAT_DONE:{n}", flush=True)
+
+
 if __name__ == "__main__":
-    run()
+    _repeat = int(os.environ.get("TOUCHDA_REPEAT", "1") or 1)
+    if _repeat > 1 and not AUTO_PUBLISH:
+        print("ERR: TOUCHDA_REPEAT>1 只支持自动发布（TOUCHDA_AUTO_PUBLISH=1）", file=sys.stderr)
+        sys.exit(2)
+    if _repeat > 1:
+        run_repeat(min(_repeat, 20))
+    else:
+        run()

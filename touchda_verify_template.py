@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import sys
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 from chrome_cdp import connect_cdp
 import touchda_config
@@ -56,6 +56,9 @@ def main() -> int:
         print("模板名为空", file=sys.stderr)
         return 2
     type_labels, btn_labels = PICKERS[rtype]
+    # touchda_run 在 import 时按 TOUCHDA_REWARD_TYPE 校验类型，先垫好再 import
+    os.environ["TOUCHDA_REWARD_TYPE"] = rtype
+    import touchda_run as TR
 
     with sync_playwright() as p:
         try:
@@ -68,7 +71,7 @@ def main() -> int:
         try:
             page.goto(CAMPAIGN_URL, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(3500)
-            if page.query_selector("input[type=password]"):
+            if TR._looks_like_login_page(page) or "loginRequired=yes" in page.url:
                 print("看起来没登录 mgnt-webserver", file=sys.stderr)
                 return 2
 
@@ -110,62 +113,16 @@ def main() -> int:
             )
             page.wait_for_timeout(2000)
 
-            picked = page.evaluate(
-                """(labels) => {
-                    const s = document.querySelector('select[ng-model="group.rewardType"]');
-                    if (!s) return {err: 'no rewardType select'};
-                    const opts = Array.from(s.options).map(o => o.textContent.trim()).filter(Boolean);
-                    let o = null;
-                    for (const w of labels) { o = Array.from(s.options).find(x => x.textContent.trim() === w); if (o) break; }
-                    if (!o) return {err: 'type not in dropdown', opts};
-                    s.value = o.value; s.dispatchEvent(new Event('change', {bubbles:true}));
-                    try { angular.element(s).scope().$apply(); } catch (x) {}
-                    return {ok: o.textContent.trim()};
-                }""",
-                type_labels,
-            )
-            if picked.get("err"):
-                print(f"优惠类型不可选（{picked['err']}）。下拉里实际有：{picked.get('opts')}",
-                      file=sys.stderr)
-                return 1
-            page.wait_for_timeout(2000)
-
-            btn = page.evaluate(
-                """(cands) => {
-                    const bs = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent !== null);
-                    for (const w of cands) { const h = bs.find(b => b.textContent.trim() === w); if (h) return h.textContent.trim(); }
-                    const loose = bs.find(b => /^\\s*选择/.test(b.textContent || ''));
-                    return loose ? loose.textContent.trim() : null;
-                }""",
-                btn_labels,
-            )
-            if not btn:
-                print("没找到「选择…」按钮", file=sys.stderr)
-                return 1
-            page.evaluate(
-                "l => Array.from(document.querySelectorAll('button'))"
-                ".find(b => b.textContent.trim() === l).click()", btn
-            )
+            # 下拉 / 选择按钮 / 读模板行全部复用 touchda_run，别再各写一份（旧写法停在 8 月改版前，误报过「列表是空的」）
             try:
-                page.wait_for_function(
-                    """() => {const b = Array.from(document.querySelectorAll('button'))
-                        .find(x => x.textContent.trim() === '确定' && x.offsetParent !== null);
-                        if (!b) return false;
-                        const vm = angular.element(b).scope().vm;
-                        return (vm.currentSelectionList || []).length > 0;}""",
-                    timeout=15000,
-                )
-            except PWTimeout:
-                print(f"「{btn}」弹窗里列表是空的（后台可能没配这类模板）", file=sys.stderr)
+                TR.select_by_label_any(page, 'select[ng-model="group.rewardType"]', type_labels)
+                page.wait_for_timeout(2000)
+                btn = TR._open_reward_modal(page, btn_labels)
+                names = TR._reward_rows(page, btn)
+            except Exception as exc:   # RuntimeError（没这类型/没模板）或 Playwright 超时
+                print(exc, file=sys.stderr)
                 return 1
-
-            names = page.evaluate(
-                """() => {const b = Array.from(document.querySelectorAll('button'))
-                    .filter(x => x.textContent.trim() === '确定' && x.offsetParent !== null)[0];
-                    const vm = angular.element(b).scope().vm;
-                    return (vm.currentSelectionList || []).map(i => i && (i.eventName || i.name)).filter(Boolean);}"""
-            )
-            hit = name in names
+            hit = any(name in n for n in names)
             print(f"{'✓ 找到' if hit else '✗ 没找到'}  {name!r}   （{btn} 列表共 {len(names)} 项）")
             if not hit:
                 print("列表里实际有：")
