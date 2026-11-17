@@ -23,6 +23,26 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from chrome_cdp import connect_cdp, headless_context, host_of
 import touchda_config
 
+
+def _load_req_ledger():
+    """可选的需求台账（cli bot 的 req_ledger.py）：只按明确路径加载，不动 sys.path。
+    路径 = 环境变量 REQ_LEDGER_PY，默认 ~/Documents/cli bot/req_ledger.py；没有/加载失败就返回 None（不记账）。"""
+    import importlib.util
+    path = os.path.expanduser(os.environ.get("REQ_LEDGER_PY") or "~/Documents/cli bot/req_ledger.py")
+    try:
+        if not os.path.isfile(path):
+            return None
+        spec = importlib.util.spec_from_file_location("req_ledger", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod if callable(getattr(mod, "log", None)) else None
+    except Exception as exc:   # 台账坏了也不能拖垮派发
+        print(f"[req_ledger] 没加载上（{path}）：{exc}", file=sys.stderr)
+        return None
+
+
+req_ledger = _load_req_ledger()
+
 # config.json 里的个人模版/目录先垫成环境变量默认值（调用方传的环境变量优先）
 touchda_config.apply_env_defaults()
 
@@ -150,6 +170,36 @@ def find_xlsx() -> str:
     if len(files) != 1:
         raise RuntimeError(f"expect exactly one .xlsx in {UPLOAD_DIR}, got {len(files)}")
     return str(files[0])
+
+
+def _xlsx_player_ids(path: str) -> list:
+    """名单 xlsx 里的 player id（只给台账用；不依赖 openpyxl，读不出就空）。"""
+    import re
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            xml = "".join(z.read(n).decode("utf-8", "ignore") for n in z.namelist()
+                          if n == "xl/sharedStrings.xml" or n.startswith("xl/worksheets/"))
+    except Exception:
+        return []
+    vals = (v.strip() for v in re.findall(r"<(?:t|v)[^>]*>([^<]*)</(?:t|v)>", xml))
+    return list(dict.fromkeys(v for v in vals if re.fullmatch(r"[A-Za-z]?\d{5,}", v)))
+
+
+def _ledger(xlsx_path: str, row: dict | None = None, err: str = "") -> None:
+    """台账：发布成功记一条 config + 名单里每个玩家一条「派发触达」；失败只记 run(ok=False)。"""
+    if req_ledger is None:
+        return
+    env = host_of(CAMPAIGN_URL)
+    if not err:
+        req_ledger.log("config", system="触达", type=f"触达任务（{REWARD_TYPE_LABEL}）",
+                       ids=[row["taskId"]] if row and row.get("taskId") else [], name=TASK_NAME,
+                       url=CAMPAIGN_URL, env=env,
+                       cleanup="一次性推送跑完不用管；周期任务去触达任务管理按任务名称查到后停用")
+    for pid in _xlsx_player_ids(xlsx_path):
+        req_ledger.log("run", action="派发触达", player_id=pid, ok=not err, env=env,
+                       amount=CREDIT_AMOUNT if REWARD_TYPE == "credit" else None,
+                       note=f"{REWARD_TYPE_LABEL}｜{TASK_NAME}" + (f"｜{err[:120]}" if err else ""))
 
 
 def select_by_label(page, css: str, label: str) -> None:
@@ -1187,16 +1237,18 @@ def run() -> None:
                         page.goto(CAMPAIGN_URL, wait_until="domcontentloaded", timeout=60000)
                     except Exception as e:
                         log(f"    重新打开列表也超时了：{e}")
-                    if not step_9_verify_status(page):
+                    row = step_9_verify_status(page)
+                    if not row:
                         raise RuntimeError("点了发布但页面没刷新，列表里也查不到任务 — 去后台确认是否已发布，别直接重派")
                     if shot:
                         lark_say_image(shot)
                     print(f"OK:{TASK_NAME}", flush=True)
+                    _ledger(xlsx_path, row)
                     return
                 if shot:
                     lark_say_image(shot)
                 print(f"OK:{TASK_NAME}", flush=True)
-                step_9_verify_status(page)
+                _ledger(xlsx_path, step_9_verify_status(page))
             else:
                 # Manual mode: hand off to the user. We hold the tab open and
                 # watch for the published task to appear in the list (= user
@@ -1215,6 +1267,7 @@ def run() -> None:
                     log("task appeared in list — publish succeeded")
                     lark_say(f"🎉 触达任务已发布：{TASK_NAME}")
                     print(f"OK:{TASK_NAME}", flush=True)
+                    _ledger(xlsx_path)
                 except PWTimeout:
                     log("manual publish watch timed out")
                     lark_say(f"⚠️ 等了 {BRIDGE_HOLD_SECS}s 没看到你点发布，超时收工。")
@@ -1235,7 +1288,9 @@ def run() -> None:
                     pass
                 import traceback
                 traceback.print_exc()
+                _ledger(xlsx_path, err=f"登录失效：{type(e).__name__}: {e}")
                 sys.exit(1)
+            _ledger(xlsx_path, err=f"{type(e).__name__}: {e}")
             shot = BOT_DIR / "touchda_last_error.png"
             try:
                 page.screenshot(path=str(shot), full_page=True)
